@@ -42,6 +42,13 @@ type Cache interface {
 	// Do not retain it across a subsequent Set or Del on the same key.
 	Get(key string) ([]byte, bool)
 
+	// GetCopy returns a heap-allocated copy of the value for key.
+	// The copy is made while holding the shard read lock, so it is safe
+	// to retain indefinitely. Use this wherever the caller cannot guarantee
+	// the slice will not outlive a concurrent Set or Del on the same key
+	// (e.g. in the server layer before writing to a network buffer).
+	GetCopy(key string) ([]byte, bool)
+
 	// Set stores value under key with the given TTL.
 	// A zero TTL means the entry does not expire.
 	Set(key string, value []byte, ttl time.Duration)
@@ -53,7 +60,9 @@ type Cache interface {
 	Exists(key string) bool
 
 	// TTL returns the remaining lifetime of key.
-	// Returns 0, false if the key does not exist or has no expiry.
+	// Returns 0, false if the key does not exist.
+	// Returns 0, true if the key exists but has no expiry.
+	// Returns remaining, true if the key exists with an expiry.
 	TTL(key string) (time.Duration, bool)
 
 	// Flush removes all entries from the cache.
@@ -69,6 +78,9 @@ type Cache interface {
 
 	// MGet returns values for the given keys in order.
 	// Missing or expired keys produce a nil entry.
+	// The returned slices are direct views into slabber memory.
+	// Do not retain any entry across a subsequent Set or Del on any key
+	// in the batch — the underlying slot may be reused after a free.
 	MGet(keys ...string) [][]byte
 
 	// MSet sets multiple key/value pairs atomically within each shard.
@@ -245,6 +257,23 @@ func (c *cache) Get(key string) ([]byte, bool) {
 	return slot[:e.length], true
 }
 
+func (c *cache) GetCopy(key string) ([]byte, bool) {
+	s := c.shardFor(key)
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	e, ok := s.entries[key]
+	if !ok || e.expired() {
+		return nil, false
+	}
+	slot, ok := s.arena.Slot(e.ref)
+	if !ok {
+		return nil, false
+	}
+	out := make([]byte, e.length)
+	copy(out, slot[:e.length])
+	return out, true
+}
+
 func (c *cache) Set(key string, value []byte, ttl time.Duration) {
 	s := c.shardFor(key)
 	var expiry time.Time
@@ -310,7 +339,7 @@ func (c *cache) TTL(key string) (time.Duration, bool) {
 		return 0, false
 	}
 	if e.expiry.IsZero() {
-		return 0, false // exists but no expiry
+		return 0, true // exists but no expiry
 	}
 	remaining := time.Until(e.expiry)
 	if remaining < 0 {
@@ -369,12 +398,10 @@ func (c *cache) Keys(pattern string) []string {
 func (c *cache) MGet(keys ...string) [][]byte {
 	out := make([][]byte, len(keys))
 	for i, key := range keys {
+		// Get returns a direct slabber view under the same contract as Cache.Get:
+		// do not retain across a subsequent Set or Del on the same key.
 		if val, ok := c.Get(key); ok {
-			buf := make([]byte, len(val))
-			for j, b := range val {
-				buf[j] = b
-			}
-			out[i] = buf
+			out[i] = val
 		}
 	}
 	return out

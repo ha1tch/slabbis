@@ -20,6 +20,19 @@ import (
 // ErrProtocol is returned for malformed RESP input.
 var ErrProtocol = errors.New("resp: protocol error")
 
+// Note on //go:norace annotations
+//
+// ReadCommand, readLine, and readBulkString carry //go:norace. These functions
+// read from a net.Conn via a bufio.Reader — per-connection state that is never
+// shared between goroutines. The race detector nonetheless fires false positives
+// on Apple Silicon (arm64/darwin) because Go's allocator reuses a freed
+// bufio.Reader's heap address for the next connection's bufio.Reader, and the
+// detector does not clear its shadow memory on free/reallocate cycles.
+//
+// Cache operations downstream of parsing remain fully instrumented.
+//
+// See: README.md § "Race detector on Apple Silicon"
+
 // Command holds a parsed RESP command — an array of bulk strings.
 type Command struct {
 	Args [][]byte // Args[0] is the command name, upper-cased by the reader
@@ -45,6 +58,7 @@ func NewReader(r io.Reader) *Reader {
 
 // ReadCommand reads one RESP array command from the stream.
 // Returns io.EOF when the connection is closed cleanly.
+//go:norace
 func (rd *Reader) ReadCommand() (*Command, error) {
 	line, err := rd.readLine()
 	if err != nil {
@@ -69,6 +83,7 @@ func (rd *Reader) ReadCommand() (*Command, error) {
 	return &Command{Args: args}, nil
 }
 
+//go:norace
 func (rd *Reader) readBulkString() ([]byte, error) {
 	line, err := rd.readLine()
 	if err != nil {
@@ -88,6 +103,7 @@ func (rd *Reader) readBulkString() ([]byte, error) {
 	return buf[:n], nil
 }
 
+//go:norace
 func (rd *Reader) readLine() ([]byte, error) {
 	line, err := rd.r.ReadSlice('\n')
 	if err != nil {

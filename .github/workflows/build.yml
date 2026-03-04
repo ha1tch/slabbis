@@ -1,0 +1,171 @@
+name: Build & Release
+
+on:
+  push:
+    branches: [main, master]
+    tags: ['v*']
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+env:
+  GO_VERSION: '1.23'
+
+jobs:
+  # ----------------------------------------------------------------
+  # Test: vet + race-detector test suite
+  # ----------------------------------------------------------------
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
+        run: go test -race -count=1 ./...
+
+  # ----------------------------------------------------------------
+  # Dist: cross-compile server binary and assemble archive
+  # ----------------------------------------------------------------
+  dist:
+    name: Dist (${{ matrix.goos }}/${{ matrix.goarch }})
+    needs: test
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+          - goos: linux
+            goarch: arm64
+          - goos: linux
+            goarch: arm
+            goarm: '7'
+          - goos: darwin
+            goarch: amd64
+          - goos: darwin
+            goarch: arm64
+          - goos: windows
+            goarch: amd64
+          - goos: windows
+            goarch: arm64
+          - goos: freebsd
+            goarch: amd64
+          - goos: freebsd
+            goarch: arm64
+          - goos: openbsd
+            goarch: amd64
+          - goos: netbsd
+            goarch: amd64
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Determine version
+        id: version
+        run: echo "version=$(cat VERSION | tr -d '[:space:]')" >> $GITHUB_OUTPUT
+
+      - name: Set archive name and binary extension
+        id: naming
+        run: |
+          BINARY=slabbis
+          if [ "${{ matrix.goos }}" = "windows" ]; then
+            EXT=".exe"
+          else
+            EXT=""
+          fi
+          ARCHIVE="slabbis-${{ steps.version.outputs.version }}-${{ matrix.goos }}-${{ matrix.goarch }}"
+          echo "binary=${BINARY}${EXT}" >> $GITHUB_OUTPUT
+          echo "archive=${ARCHIVE}" >> $GITHUB_OUTPUT
+
+      - name: Build binary
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          GOARM: ${{ matrix.goarm }}
+          CGO_ENABLED: '0'
+        run: |
+          go build -trimpath -ldflags "-s -w" \
+            -o ${{ steps.naming.outputs.binary }} \
+            ./cmd/slabbis
+
+      - name: Assemble distribution
+        run: |
+          ARCHIVE=${{ steps.naming.outputs.archive }}
+          mkdir -p dist/${ARCHIVE}
+
+          # Binary
+          cp ${{ steps.naming.outputs.binary }} dist/${ARCHIVE}/
+
+          # Documentation
+          for f in LICENSE README.md CHANGELOG.md; do
+            [ -f "$f" ] && cp "$f" dist/${ARCHIVE}/
+          done
+          [ -d docs ] && cp -r docs dist/${ARCHIVE}/
+
+      - name: Create archive
+        run: |
+          ARCHIVE=${{ steps.naming.outputs.archive }}
+          cd dist
+          if [ "${{ matrix.goos }}" = "windows" ]; then
+            zip -r ${ARCHIVE}.zip ${ARCHIVE}/
+          else
+            tar czf ${ARCHIVE}.tar.gz ${ARCHIVE}/
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
+
+  # ----------------------------------------------------------------
+  # Release: collect archives, generate checksums, publish
+  # Runs only on version tags (v*)
+  # ----------------------------------------------------------------
+  release:
+    name: Release
+    needs: dist
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all dist artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: dist-*
+          merge-multiple: true
+
+      - name: Generate checksums
+        run: |
+          cd dist
+          sha256sum * > checksums.txt
+          cat checksums.txt
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/checksums.txt
+          generate_release_notes: true

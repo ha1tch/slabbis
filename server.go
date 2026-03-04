@@ -7,6 +7,7 @@ import (
 	"net"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/ha1tch/slabbis/internal/resp"
@@ -40,6 +41,8 @@ type Server struct {
 	cache    Cache
 	listener net.Listener
 	log      *log.Logger
+	serveWg  sync.WaitGroup // tracks the Serve goroutine lifetime
+	connWg   sync.WaitGroup // tracks all handleConn goroutine lifetimes
 }
 
 // NewServer returns a Server bound to addr using the provided Cache.
@@ -77,16 +80,22 @@ func (s *Server) Serve() error {
 		if err != nil {
 			return err
 		}
+		s.connWg.Add(1)
 		go s.handleConn(conn)
 	}
 }
 
-// Close stops the server. Existing connections are not forcibly terminated.
+// Close stops the server and waits for all goroutines to return.
 func (s *Server) Close() error {
-	return s.listener.Close()
+	err := s.listener.Close()
+	s.serveWg.Wait()
+	s.connWg.Wait()
+	return err
 }
 
+// handleConn serves a single client connection.
 func (s *Server) handleConn(conn net.Conn) {
+	defer s.connWg.Done()
 	defer conn.Close()
 	rd := resp.NewReader(conn)
 	wr := resp.NewWriter(conn)
@@ -123,14 +132,13 @@ func (s *Server) dispatch(cmd *resp.Command, wr *resp.Writer) bool {
 			_ = wr.WriteError("wrong number of arguments for GET")
 			return false
 		}
-		val, ok := s.cache.Get(string(cmd.Args[1]))
+		// GetCopy copies inside the shard read lock, so the slice is safe
+		// to hold across concurrent Set/Del on the same key.
+		val, ok := s.cache.GetCopy(string(cmd.Args[1]))
 		if !ok {
 			_ = wr.WriteBulk(nil)
 		} else {
-			// Copy before returning — the slice is live slabber memory.
-			out := make([]byte, len(val))
-			copy(out, val)
-			_ = wr.WriteBulk(out)
+			_ = wr.WriteBulk(val)
 		}
 
 	case "SET":
@@ -220,13 +228,15 @@ func (s *Server) dispatch(cmd *resp.Command, wr *resp.Writer) bool {
 			_ = wr.WriteError("wrong number of arguments for MGET")
 			return false
 		}
-		keys := make([]string, len(cmd.Args)-1)
+		// Use GetCopy per key rather than MGet: MGet returns live slabber
+		// views that could be mutated by a concurrent Set before WriteArray
+		// finishes reading them. GetCopy copies under the shard read lock.
+		vals := make([][]byte, len(cmd.Args)-1)
 		for i, arg := range cmd.Args[1:] {
-			keys[i] = string(arg)
+			if v, ok := s.cache.GetCopy(string(arg)); ok {
+				vals[i] = v
+			}
 		}
-		vals := s.cache.MGet(keys...)
-		// WriteArray treats nil entries as null bulk strings, which is correct
-		// MGET semantics for missing keys.
 		_ = wr.WriteArray(vals)
 
 	case "MSET":

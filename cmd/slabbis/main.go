@@ -4,6 +4,7 @@
 // Usage:
 //
 //	slabbis [flags]
+//	slabbis version
 //
 // Flags:
 //
@@ -14,7 +15,8 @@
 //	      Number of key-space shards. 0 = runtime.NumCPU(). (default 0)
 //	-reaper duration
 //	      TTL reaper interval per shard. (default 1s)
-//	-v    Print version and exit.
+//	-v, -version, --version
+//	      Print version and exit.
 //
 // Example:
 //
@@ -40,15 +42,33 @@ import (
 	"github.com/ha1tch/slabbis"
 )
 
+func printVersion() {
+	fmt.Printf("slabbis %s\n", slabbis.Version)
+}
+
 func main() {
+	// Handle bare "version" subcommand before flag.Parse so it works
+	// even when other flags are also registered.
+	if len(os.Args) > 1 && os.Args[1] == "version" {
+		printVersion()
+		os.Exit(0)
+	}
+
 	addr := flag.String("addr", "127.0.0.1:6379", "listen address (TCP or unix://path)")
 	shards := flag.Int("shards", 0, "key-space shards (0 = NumCPU)")
 	reaper := flag.Duration("reaper", time.Second, "TTL reaper interval")
-	version := flag.Bool("v", false, "print version and exit")
+
+	// All of -v, -version, --version write to the same variable.
+	// Go's flag package accepts both single-dash and double-dash for any
+	// registered flag, so registering "version" covers -version and --version.
+	var showVersion bool
+	flag.BoolVar(&showVersion, "v", false, "print version and exit")
+	flag.BoolVar(&showVersion, "version", false, "print version and exit")
+
 	flag.Parse()
 
-	if *version {
-		fmt.Printf("slabbis %s\n", slabbis.Version)
+	if showVersion {
+		printVersion()
 		os.Exit(0)
 	}
 

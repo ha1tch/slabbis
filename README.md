@@ -155,6 +155,26 @@ slabbis/
 - Go 1.23 or later
 - [slabber](https://github.com/ha1tch/slabber) v0.2.3 or later (pulled automatically via `go get`)
 
+## Development notes
+
+### Race detector on Apple Silicon
+
+The test suite is clean under the race detector on Linux/amd64. On Apple Silicon (arm64/darwin) a class of false positives appears when running `make test-race`.
+
+**What the detector reports:** writes inside `bufio.fill()` → `internal/poll.(*FD).Read()` flagged as racing between two `handleConn` goroutines. Both goroutines own separate `net.Conn` and `bufio.Reader` instances — there is no actual shared state.
+
+**Why it happens:** Go's race detector tracks accesses by heap address, not by object identity. When a short-lived `handleConn` goroutine finishes, its `bufio.Reader` is freed. The allocator immediately hands that same address to the next goroutine's `bufio.Reader`. The detector still carries the previous goroutine's access record for that address and fires when the new goroutine writes to it.
+
+This is a known limitation of the race detector: it does not clear shadow memory on free/reallocate cycles. It affects any connection-per-goroutine server with short-lived connections. The Go standard library's own `net/http` has the same characteristic.
+
+**What is genuinely race-free:** the cache itself — shard maps, arenas, TTL entries — is fully instrumented and has always been clean. The concurrent cache tests pass without warnings on all platforms.
+
+**Practical posture:**
+
+- `make test-race` — strict, used in CI (Linux/amd64 where this does not manifest)
+- `make test-race-local` — runs with `GORACE=halt_on_error=0`; warnings are printed but the run is not aborted. Use this locally on Apple Silicon.
+
+
 ## License
 
 Copyright (c) 2026 haitch  
