@@ -165,6 +165,15 @@ func (wr *Writer) WriteBulk(b []byte) error {
 	return err
 }
 
+// WriteArrayHeader writes *N\r\n — the array prefix for a RESP array of n
+// elements. Use this when the elements will be written individually with
+// subsequent WriteBulk calls, allowing the caller to reuse a single buffer
+// across all elements rather than collecting them all before writing.
+func (wr *Writer) WriteArrayHeader(n int) error {
+	_, err := fmt.Fprintf(wr.w, "*%d\r\n", n)
+	return err
+}
+
 // WriteArray writes *N\r\n followed by N bulk strings.
 func (wr *Writer) WriteArray(items [][]byte) error {
 	if _, err := fmt.Fprintf(wr.w, "*%d\r\n", len(items)); err != nil {

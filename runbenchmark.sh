@@ -125,6 +125,12 @@ if [[ ! -f "$BENCH_DIR/go.mod" ]]; then
     exit 1
 fi
 
+if [[ ! -f "$BENCH_DIR/go.sum" ]]; then
+    echo "  running go mod tidy in bench/ (first run)"
+    (cd "$BENCH_DIR" && go mod tidy)
+    echo ""
+fi
+
 (
     cd "$BENCH_DIR"
     go run . \

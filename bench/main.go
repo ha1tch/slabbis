@@ -345,16 +345,20 @@ func (o opKind) needsSeed() bool {
 // ─── factory constructors ─────────────────────────────────────────────────────
 
 // inProcFactory builds a factory for the in-process slabbis.Cache target.
-// GET and MGET use GetCopy, matching the behaviour of the RESP server after
-// the v0.1.1 race fix.
+// GET, MGET, and Mixed 80/20 use GetInto with a per-goroutine scratch buffer,
+// matching the server's pooled-buffer strategy introduced in v0.1.2.
 func inProcFactory(op opKind, cfg config, c slabbis.Cache) factory {
 	v := valBytes(cfg.valueSize)
 	return func(id int) (func() error, func()) {
 		rng := rand.New(rand.NewSource(int64(id + 1)))
 		switch op {
 		case opGET:
+			// Pre-allocate a scratch buffer; reuse across calls via GetInto.
+			// Mirrors the server's pooled-buffer strategy: zero heap allocations
+			// in steady state.
+			dst := make([]byte, 0, cfg.valueSize)
 			return func() error {
-				c.GetCopy(randKey(rng, cfg.keySpace))
+				dst, _ = c.GetInto(randKey(rng, cfg.keySpace), dst)
 				return nil
 			}, nil
 		case opSET:
@@ -373,29 +377,35 @@ func inProcFactory(op opKind, cfg config, c slabbis.Cache) factory {
 				return nil
 			}, nil
 		case opMixed8020:
+			dst := make([]byte, 0, cfg.valueSize)
 			return func() error {
 				if rng.Intn(100) < 80 {
-					c.GetCopy(randKey(rng, cfg.keySpace))
+					dst, _ = c.GetInto(randKey(rng, cfg.keySpace), dst)
 				} else {
 					c.Set(randKey(rng, cfg.keySpace), v, 0)
 				}
 				return nil
 			}, nil
 		case opMGET:
-			// Mirror the server's per-key GetCopy implementation.
+			// One scratch buffer reused across all keys in the batch,
+			// mirroring the server's streaming MGET with a pooled buffer.
 			keys := make([]string, cfg.batchSize)
+			dst := make([]byte, 0, cfg.valueSize)
 			return func() error {
 				for i := range keys {
 					keys[i] = randKey(rng, cfg.keySpace)
 				}
 				for _, k := range keys {
-					c.GetCopy(k)
+					dst, _ = c.GetInto(k, dst)
 				}
 				return nil
 			}, nil
 		case opMSET:
-			pairs := make(map[string][]byte, cfg.batchSize)
+			// Allocate a fresh map each call. A captured map would accumulate
+			// keys across calls (never cleared), growing to the full key space
+			// and causing MSet to iterate thousands of entries per op.
 			return func() error {
+				pairs := make(map[string][]byte, cfg.batchSize)
 				for i := 0; i < cfg.batchSize; i++ {
 					pairs[randKey(rng, cfg.keySpace)] = v
 				}

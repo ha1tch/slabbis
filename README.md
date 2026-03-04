@@ -67,8 +67,12 @@ defer cache.Close()
 // Store a value with a 30-second TTL.
 cache.Set("session:abc123", []byte(`{"user":42}`), 30*time.Second)
 
-// Retrieve it.
-val, ok := cache.Get("session:abc123")
+// Retrieve — heap-allocates a copy safe to retain indefinitely.
+val, ok := cache.GetCopy("session:abc123")
+
+// Retrieve into a caller-supplied buffer; zero allocation in steady state.
+// Pool or reuse dst across calls for best performance.
+dst, ok = cache.GetInto("session:abc123", dst)
 
 // Check presence without retrieving.
 cache.Exists("session:abc123")
@@ -91,8 +95,11 @@ slabbis -addr unix:///tmp/slabbis.sock
 # Custom shards and reaper interval
 slabbis -addr 127.0.0.1:6379 -shards 16 -reaper 500ms
 
-# Print version
+# Print version (all equivalent)
+slabbis version
 slabbis -v
+slabbis -version
+slabbis --version
 ```
 
 Default address: `127.0.0.1:6379`.
@@ -133,7 +140,7 @@ On a `Set`, the old value is freed and a new slot is allocated before the map is
 ```
 slabbis/
   slabbis.go          Cache interface and *cache implementation
-  server.go           RESP2 server wrapping Cache
+  server.go           RESP2 server wrapping Cache (pooled zero-alloc reads)
   version.go
   internal/
     resp/
@@ -141,6 +148,12 @@ slabbis/
   cmd/
     slabbis/
       main.go         Standalone server binary
+  bench/
+    main.go           Comparative benchmark: in-process vs slabbis-RESP vs Redis
+  perf/
+    charts.py         Chart generation (matplotlib)
+    report.tex        Performance report (LaTeX)
+    report.pdf        Compiled report
 ```
 
 ## What slabbis is not

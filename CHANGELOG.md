@@ -6,6 +6,36 @@ Format: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ---
 
+## [0.1.2] - 2026-03-04
+
+### Added
+
+- **`Cache.GetInto(key string, dst []byte) ([]byte, bool)`**: zero-allocation
+  companion to `GetCopy`. Copies the value into a caller-supplied buffer,
+  growing it only when `cap(dst) < len(value)`. Callers that pool or reuse
+  `dst` (e.g. one buffer per server connection) achieve zero per-call heap
+  allocations in steady state.
+- **`resp.Writer.WriteArrayHeader(n int) error`**: writes the `*N\r\n` RESP
+  array prefix without requiring all elements to be buffered first. Enables
+  streaming MGET responses over a single pooled buffer.
+
+### Changed
+
+- **Server GET handler**: switched from `GetCopy` (heap allocation per request)
+  to `GetInto` with a `sync.Pool` of `*[]byte` buffers. In steady state, each
+  pooled buffer grows to the high-water mark of values on its connection and
+  is reused with zero heap allocations.
+- **Server MGET handler**: replaced the `[][]byte` vals slice + per-key
+  `GetCopy` pattern with a streaming approach: write the array header first,
+  then loop `GetInto` + `WriteBulk` per key using a single pooled buffer.
+  Eliminates the vals allocation and all per-key value allocations.
+- **Benchmark in-process GET and MGET**: updated to use `GetInto` with a
+  per-goroutine scratch buffer, matching the server's zero-alloc strategy.
+  Prior numbers for these two operations were artificially penalised by
+  `GetCopy` allocations.
+
+---
+
 ## [0.1.1] - 2026-03-04
 
 ### Fixed

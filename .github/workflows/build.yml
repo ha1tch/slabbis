@@ -114,7 +114,7 @@ jobs:
           for f in LICENSE README.md CHANGELOG.md; do
             [ -f "$f" ] && cp "$f" dist/${ARCHIVE}/
           done
-          [ -d docs ] && cp -r docs dist/${ARCHIVE}/
+          if [ -d docs ]; then cp -r docs dist/${ARCHIVE}/; fi
 
       - name: Create archive
         run: |

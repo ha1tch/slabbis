@@ -49,6 +49,18 @@ type Cache interface {
 	// (e.g. in the server layer before writing to a network buffer).
 	GetCopy(key string) ([]byte, bool)
 
+	// GetInto copies the value for key into dst, growing dst if necessary,
+	// and returns the populated slice and whether the key was found.
+	// The copy is made while holding the shard read lock.
+	//
+	// Unlike GetCopy, GetInto does not allocate when cap(dst) >= len(value).
+	// Callers that pool or reuse dst (e.g. one buffer per server connection)
+	// achieve zero per-call allocations in steady state.
+	//
+	// The returned slice aliases dst. Callers must not retain it across a
+	// subsequent call that reuses the same dst.
+	GetInto(key string, dst []byte) ([]byte, bool)
+
 	// Set stores value under key with the given TTL.
 	// A zero TTL means the entry does not expire.
 	Set(key string, value []byte, ttl time.Duration)
@@ -272,6 +284,26 @@ func (c *cache) GetCopy(key string) ([]byte, bool) {
 	out := make([]byte, e.length)
 	copy(out, slot[:e.length])
 	return out, true
+}
+
+func (c *cache) GetInto(key string, dst []byte) ([]byte, bool) {
+	s := c.shardFor(key)
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	e, ok := s.entries[key]
+	if !ok || e.expired() {
+		return dst[:0], false
+	}
+	slot, ok := s.arena.Slot(e.ref)
+	if !ok {
+		return dst[:0], false
+	}
+	if cap(dst) < e.length {
+		dst = make([]byte, e.length)
+	}
+	dst = dst[:e.length]
+	copy(dst, slot[:e.length])
+	return dst, true
 }
 
 func (c *cache) Set(key string, value []byte, ttl time.Duration) {

@@ -13,6 +13,19 @@ import (
 	"github.com/ha1tch/slabbis/internal/resp"
 )
 
+// valBufPool is a pool of value-copy buffers shared across server connections.
+// GET and MGET handlers borrow a buffer, call GetInto to copy under the shard
+// read lock, write the result to the RESP wire buffer (which copies the bytes),
+// then return the buffer to the pool. In steady state each buffer grows to the
+// high-water mark of values seen on its connection and is reused with zero
+// heap allocations.
+var valBufPool = sync.Pool{
+	New: func() any {
+		b := make([]byte, 0, 512)
+		return &b
+	},
+}
+
 // Server listens on a network address and dispatches RESP commands to a Cache.
 // It supports exactly the commands slabbis exposes; anything else returns an
 // error response rather than a panic.
@@ -132,14 +145,18 @@ func (s *Server) dispatch(cmd *resp.Command, wr *resp.Writer) bool {
 			_ = wr.WriteError("wrong number of arguments for GET")
 			return false
 		}
-		// GetCopy copies inside the shard read lock, so the slice is safe
-		// to hold across concurrent Set/Del on the same key.
-		val, ok := s.cache.GetCopy(string(cmd.Args[1]))
+		// Borrow a pooled buffer, copy the value into it under the shard read
+		// lock via GetInto, write to the wire buffer (which copies the bytes),
+		// then return. Zero heap allocations in steady state.
+		bp := valBufPool.Get().(*[]byte)
+		dst, ok := s.cache.GetInto(string(cmd.Args[1]), *bp)
+		*bp = dst
 		if !ok {
 			_ = wr.WriteBulk(nil)
 		} else {
-			_ = wr.WriteBulk(val)
+			_ = wr.WriteBulk(dst)
 		}
+		valBufPool.Put(bp)
 
 	case "SET":
 		if len(cmd.Args) < 3 {
@@ -228,16 +245,23 @@ func (s *Server) dispatch(cmd *resp.Command, wr *resp.Writer) bool {
 			_ = wr.WriteError("wrong number of arguments for MGET")
 			return false
 		}
-		// Use GetCopy per key rather than MGet: MGet returns live slabber
-		// views that could be mutated by a concurrent Set before WriteArray
-		// finishes reading them. GetCopy copies under the shard read lock.
-		vals := make([][]byte, len(cmd.Args)-1)
-		for i, arg := range cmd.Args[1:] {
-			if v, ok := s.cache.GetCopy(string(arg)); ok {
-				vals[i] = v
+		// Write the array header first, then stream each value directly using
+		// a single pooled buffer. This avoids allocating the vals [][]byte
+		// slice and per-key GetCopy allocations. The buffer is borrowed once
+		// for the whole batch and returned after the last key.
+		n := len(cmd.Args) - 1
+		_ = wr.WriteArrayHeader(n)
+		bp := valBufPool.Get().(*[]byte)
+		for _, arg := range cmd.Args[1:] {
+			dst, ok := s.cache.GetInto(string(arg), *bp)
+			*bp = dst
+			if ok {
+				_ = wr.WriteBulk(dst)
+			} else {
+				_ = wr.WriteBulk(nil)
 			}
 		}
-		_ = wr.WriteArray(vals)
+		valBufPool.Put(bp)
 
 	case "MSET":
 		if len(cmd.Args) < 3 || len(cmd.Args)%2 == 0 {
