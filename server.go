@@ -5,6 +5,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"sort"
 	"strings"
 	"time"
 
@@ -19,8 +20,16 @@ import (
 //
 //	GET key
 //	SET key value [EX seconds | PX milliseconds]
+//	MGET key [key ...]
+//	MSET key value [key value ...]
+//	SETNX key value
+//	GETDEL key
 //	DEL key [key ...]
 //	EXISTS key [key ...]
+//	KEYS pattern
+//	RENAME from to
+//	DBSIZE
+//	TYPE key
 //	TTL key
 //	PTTL key
 //	FLUSH (non-standard; equivalent to FLUSHALL)
@@ -191,6 +200,94 @@ func (s *Server) dispatch(cmd *resp.Command, wr *resp.Writer) bool {
 			_ = wr.WriteInt(-1)
 		} else {
 			_ = wr.WriteInt(remaining.Milliseconds())
+		}
+
+	case "KEYS":
+		if len(cmd.Args) != 2 {
+			_ = wr.WriteError("wrong number of arguments for KEYS")
+			return false
+		}
+		keys := s.cache.Keys(string(cmd.Args[1]))
+		sort.Strings(keys)
+		items := make([][]byte, len(keys))
+		for i, k := range keys {
+			items[i] = []byte(k)
+		}
+		_ = wr.WriteArray(items)
+
+	case "MGET":
+		if len(cmd.Args) < 2 {
+			_ = wr.WriteError("wrong number of arguments for MGET")
+			return false
+		}
+		keys := make([]string, len(cmd.Args)-1)
+		for i, arg := range cmd.Args[1:] {
+			keys[i] = string(arg)
+		}
+		vals := s.cache.MGet(keys...)
+		// WriteArray treats nil entries as null bulk strings, which is correct
+		// MGET semantics for missing keys.
+		_ = wr.WriteArray(vals)
+
+	case "MSET":
+		if len(cmd.Args) < 3 || len(cmd.Args)%2 == 0 {
+			_ = wr.WriteError("wrong number of arguments for MSET")
+			return false
+		}
+		pairs := make(map[string][]byte, (len(cmd.Args)-1)/2)
+		for i := 1; i < len(cmd.Args); i += 2 {
+			pairs[string(cmd.Args[i])] = cmd.Args[i+1]
+		}
+		s.cache.MSet(0, pairs)
+		_ = wr.WriteSimpleString("OK")
+
+	case "SETNX":
+		if len(cmd.Args) != 3 {
+			_ = wr.WriteError("wrong number of arguments for SETNX")
+			return false
+		}
+		set := s.cache.SetNX(string(cmd.Args[1]), cmd.Args[2], 0)
+		if set {
+			_ = wr.WriteInt(1)
+		} else {
+			_ = wr.WriteInt(0)
+		}
+
+	case "GETDEL":
+		if len(cmd.Args) != 2 {
+			_ = wr.WriteError("wrong number of arguments for GETDEL")
+			return false
+		}
+		val, ok := s.cache.GetDel(string(cmd.Args[1]))
+		if !ok {
+			_ = wr.WriteBulk(nil)
+		} else {
+			_ = wr.WriteBulk(val)
+		}
+
+	case "RENAME":
+		if len(cmd.Args) != 3 {
+			_ = wr.WriteError("wrong number of arguments for RENAME")
+			return false
+		}
+		if !s.cache.Rename(string(cmd.Args[1]), string(cmd.Args[2])) {
+			_ = wr.WriteError("no such key")
+			return false
+		}
+		_ = wr.WriteSimpleString("OK")
+
+	case "DBSIZE":
+		_ = wr.WriteInt(int64(s.cache.DBSize()))
+
+	case "TYPE":
+		if len(cmd.Args) != 2 {
+			_ = wr.WriteError("wrong number of arguments for TYPE")
+			return false
+		}
+		if s.cache.Exists(string(cmd.Args[1])) {
+			_ = wr.WriteSimpleString("string")
+		} else {
+			_ = wr.WriteSimpleString("none")
 		}
 
 	case "FLUSH", "FLUSHALL", "FLUSHDB":

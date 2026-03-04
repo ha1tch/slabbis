@@ -8,8 +8,8 @@
 // Flags:
 //
 //	-addr string
-//	      Listen address. TCP: "127.0.0.1:6399". Unix: "unix:///tmp/slabbis.sock".
-//	      (default "127.0.0.1:6399")
+//	      Listen address. TCP: "127.0.0.1:6379". Unix: "unix:///tmp/slabbis.sock".
+//	      (default "127.0.0.1:6379")
 //	-shards int
 //	      Number of key-space shards. 0 = runtime.NumCPU(). (default 0)
 //	-reaper duration
@@ -20,8 +20,9 @@
 //
 //	slabbis -addr unix:///tmp/slabbis.sock -shards 16
 //
-// slabbis speaks RESP2. It supports: GET, SET [EX|PX], DEL, EXISTS, TTL,
-// PTTL, FLUSH, PING, COMMAND, QUIT.
+// slabbis speaks RESP2. It supports: GET, MGET, SET [EX|PX], MSET, SETNX,
+// GETDEL, DEL, EXISTS, KEYS, RENAME, DBSIZE, TYPE, TTL, PTTL, FLUSH, PING,
+// COMMAND, QUIT.
 //
 // It does not support persistence, replication, pub/sub, scripting, or any
 // other Redis feature outside that list. This is by design.
@@ -40,7 +41,7 @@ import (
 )
 
 func main() {
-	addr := flag.String("addr", "127.0.0.1:6399", "listen address (TCP or unix://path)")
+	addr := flag.String("addr", "127.0.0.1:6379", "listen address (TCP or unix://path)")
 	shards := flag.Int("shards", 0, "key-space shards (0 = NumCPU)")
 	reaper := flag.Duration("reaper", time.Second, "TTL reaper interval")
 	version := flag.Bool("v", false, "print version and exit")

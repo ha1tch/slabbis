@@ -17,8 +17,16 @@ It speaks enough of the Redis protocol to be a drop-in for pure caching workload
 ```
 GET key
 SET key value [EX seconds | PX milliseconds]
+MGET key [key ...]
+MSET key value [key value ...]
+SETNX key value
+GETDEL key
 DEL key [key ...]
 EXISTS key [key ...]
+KEYS pattern
+RENAME from to
+DBSIZE
+TYPE key
 TTL key
 PTTL key
 FLUSH
@@ -81,13 +89,13 @@ slabbis
 slabbis -addr unix:///tmp/slabbis.sock
 
 # Custom shards and reaper interval
-slabbis -addr 127.0.0.1:6399 -shards 16 -reaper 500ms
+slabbis -addr 127.0.0.1:6379 -shards 16 -reaper 500ms
 
 # Print version
 slabbis -v
 ```
 
-Default address: `127.0.0.1:6399`.
+Default address: `127.0.0.1:6379`.
 
 Once running, any Redis client works:
 

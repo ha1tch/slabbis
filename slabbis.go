@@ -26,6 +26,7 @@
 package slabbis
 
 import (
+	"path"
 	"runtime"
 	"sync"
 	"time"
@@ -60,6 +61,32 @@ type Cache interface {
 
 	// Stats returns a point-in-time snapshot of cache state.
 	Stats() CacheStats
+
+	// Keys returns all live keys matching pattern.
+	// Pattern uses filepath.Match syntax: * matches any sequence, ? matches
+	// any single character. Use "*" to return all keys.
+	Keys(pattern string) []string
+
+	// MGet returns values for the given keys in order.
+	// Missing or expired keys produce a nil entry.
+	MGet(keys ...string) [][]byte
+
+	// MSet sets multiple key/value pairs atomically within each shard.
+	// A zero TTL means no expiry. Existing keys are overwritten.
+	MSet(ttl time.Duration, pairs map[string][]byte)
+
+	// SetNX sets key to value only if the key does not already exist.
+	// Returns true if the key was set.
+	SetNX(key string, value []byte, ttl time.Duration) bool
+
+	// GetDel returns the value for key and removes it atomically.
+	GetDel(key string) ([]byte, bool)
+
+	// Rename renames key from to key to. Returns false if from does not exist.
+	Rename(from, to string) bool
+
+	// DBSize returns the total number of live keys across all shards.
+	DBSize() int
 
 	// Close stops background goroutines. The cache must not be used after Close.
 	Close()
@@ -320,6 +347,101 @@ func (c *cache) Stats() CacheStats {
 		Keys:      keys,
 		SlabStats: c.shards[0].arena.Stats(),
 	}
+}
+
+func (c *cache) Keys(pattern string) []string {
+	var out []string
+	for _, s := range c.shards {
+		s.mu.RLock()
+		for k, e := range s.entries {
+			if e.expired() {
+				continue
+			}
+			if matched, _ := path.Match(pattern, k); matched {
+				out = append(out, k)
+			}
+		}
+		s.mu.RUnlock()
+	}
+	return out
+}
+
+func (c *cache) MGet(keys ...string) [][]byte {
+	out := make([][]byte, len(keys))
+	for i, key := range keys {
+		if val, ok := c.Get(key); ok {
+			buf := make([]byte, len(val))
+			for j, b := range val {
+				buf[j] = b
+			}
+			out[i] = buf
+		}
+	}
+	return out
+}
+
+func (c *cache) MSet(ttl time.Duration, pairs map[string][]byte) {
+	for k, v := range pairs {
+		c.Set(k, v, ttl)
+	}
+}
+
+func (c *cache) SetNX(key string, value []byte, ttl time.Duration) bool {
+	s := c.shardFor(key)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if e, ok := s.entries[key]; ok && !e.expired() {
+		return false
+	}
+	var expiry time.Time
+	if ttl > 0 {
+		expiry = time.Now().Add(ttl)
+	}
+	ref, slot, ok := s.arena.Alloc(len(value))
+	if !ok {
+		return false
+	}
+	copy(slot, value)
+	s.entries[key] = entry{ref: ref, length: len(value), expiry: expiry}
+	return true
+}
+
+func (c *cache) GetDel(key string) ([]byte, bool) {
+	s := c.shardFor(key)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	e, ok := s.entries[key]
+	if !ok || e.expired() {
+		if ok {
+			s.arena.Free(e.ref)
+			delete(s.entries, key)
+		}
+		return nil, false
+	}
+	slot, ok2 := s.arena.Slot(e.ref)
+	var out []byte
+	if ok2 {
+		out = make([]byte, e.length)
+		copy(out, slot[:e.length])
+	}
+	s.arena.Free(e.ref)
+	delete(s.entries, key)
+	return out, ok2
+}
+
+func (c *cache) Rename(from, to string) bool {
+	// Read + delete from source, then set on destination.
+	// Done in two steps to avoid deadlock when from and to land in the same shard.
+	val, ok := c.GetDel(from)
+	if !ok {
+		return false
+	}
+	c.Set(to, val, 0)
+	return true
+}
+
+func (c *cache) DBSize() int {
+	return c.Stats().Keys
 }
 
 func (c *cache) Close() {
