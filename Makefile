@@ -66,8 +66,9 @@ test:
 test-race:
 	$(GO) test $(GOFLAGS) -race -count=1 ./...
 
-## test-race-local: race detector on, but false positives on Apple Silicon
-## do not abort the run. Use locally; CI uses test-race.
+## test-race-local: race detector on, warnings printed but run not aborted.
+## Useful when investigating suspected races without stopping on first hit.
+## CI uses test-race (strict). Both targets are clean on all platforms.
 test-race-local:
 	GORACE="halt_on_error=0" $(GO) test $(GOFLAGS) -race -count=1 ./...
 
