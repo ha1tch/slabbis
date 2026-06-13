@@ -17,22 +17,42 @@ It speaks enough of the Redis protocol to be a drop-in for pure caching workload
 ```
 GET key
 SET key value [EX seconds | PX milliseconds]
+GETSET key value
+GETEX key [EX seconds | PX milliseconds | PERSIST]
 MGET key [key ...]
 MSET key value [key value ...]
 SETNX key value
 GETDEL key
 DEL key [key ...]
+UNLINK key [key ...]
 EXISTS key [key ...]
+STRLEN key
+INCR key
+INCRBY key increment
+DECR key
+DECRBY key decrement
 KEYS pattern
+SCAN cursor [MATCH pattern] [COUNT count]
+RANDOMKEY
+COPY source destination
 RENAME from to
 DBSIZE
 TYPE key
 TTL key
 PTTL key
+EXPIRE key seconds
+PEXPIRE key milliseconds
+PERSIST key
 FLUSH
 PING [message]
 QUIT
 ```
+
+### KEYS vs SCAN
+
+Both commands enumerate live keys. `KEYS` returns all matching keys in one response. `SCAN` is the cursor-based iterator Redis clients use by default (most client libraries — including `go-redis` — issue `SCAN`, not `KEYS`, for key enumeration).
+
+Because slabbis holds all keys in memory with no on-disk representation, a full scan is always available in a single pass. `SCAN` therefore always returns cursor `0` (scan complete) along with all matching keys. Clients that loop until cursor `0` will terminate correctly after the first call. `COUNT` is accepted and ignored — it is a hint for disk-based stores and has no meaning here.
 
 That is the entire surface. If you need anything else, use Redis or Valkey.
 
@@ -63,6 +83,16 @@ import (
 // Default config: NumCPU shards, five size classes, 1s reaper interval.
 cache := slabbis.NewDefault()
 defer cache.Close()
+
+// Development / test config: tiny footprint, safe in constrained environments.
+cache := slabbis.New(slabbis.DevConfig())
+defer cache.Close()
+
+// Guard against silent drops before calling Set.
+cfg := slabbis.Config{...}
+if len(value) > cfg.MaxValueSize() {
+    // handle oversized value explicitly
+}
 
 // Store a value with a 30-second TTL.
 cache.Set("session:abc123", []byte(`{"user":42}`), 30*time.Second)
@@ -96,6 +126,18 @@ slabbis -addr unix:///tmp/slabbis.sock
 # Custom shards and reaper interval
 slabbis -addr 127.0.0.1:6379 -shards 16 -reaper 500ms
 
+# Set maximum value size (single size class, 1MB ceiling)
+slabbis -max-value 1048576
+
+# Fine-grained size classes (128B / 4KB / 64KB)
+slabbis -classes 128,4096,65536
+
+# Reduce startup footprint (1 bucket per shard instead of NumCPU)
+slabbis -shards 4 -buckets 1 -max-value 65536
+
+# Development / CI mode: tiny footprint, overrides other Config flags
+slabbis -dev
+
 # Print version (all equivalent)
 slabbis version
 slabbis -v
@@ -104,6 +146,12 @@ slabbis --version
 ```
 
 Default address: `127.0.0.1:6379`.
+
+The startup log line includes the effective slab configuration:
+
+```
+slabbis: listening on 127.0.0.1:6379 (shards=8, classes=5, max_value=262144B)
+```
 
 Once running, any Redis client works:
 
@@ -149,8 +197,6 @@ slabbis/
   cmd/
     slabbis/
       main.go         Standalone server binary
-  bench/
-    main.go           Comparative benchmark: in-process vs slabbis-RESP vs Redis
   perf/
     charts.py         Chart generation (matplotlib)
     report.tex        Performance report (LaTeX)

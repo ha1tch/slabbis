@@ -6,6 +6,169 @@ Format: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ---
 
+## [0.1.5] - 2026-06-12
+
+### Added
+
+This release addresses all actionable items from the olu integration feedback
+report. Item #2b (adding an error return to `Cache.Set`) is deferred to v0.2.0
+as a deliberate breaking-interface change.
+
+**`SCAN cursor [MATCH pattern] [COUNT count]`** (item #1 — was blocking for
+`go-redis` and most Redis client libraries). slabbis holds all keys in memory
+and can always enumerate them in a single pass; `SCAN` therefore always returns
+cursor `"0"` (iteration complete) alongside all matching keys. `COUNT` is
+accepted and ignored. Clients that loop until cursor `"0"` terminate correctly
+after one call. This unblocks all client libraries that issue `SCAN` for key
+enumeration rather than `KEYS`.
+
+**`Config.MaxValueSize() int`** (item #4a). Returns the `MaxSize` of the
+largest configured size class — the hard ceiling above which `Set` silently
+drops values. Callers can check before calling `Set` to avoid the silent-drop
+hazard: `if len(value) > cfg.MaxValueSize() { /* handle */ }`.
+
+**`DevConfig() Config`** (item #3). A named constructor for development,
+testing, and memory-constrained environments (CI, sandboxes). Two size classes
+(64B / 4KB), one shard, one bucket per shard, 50ms reaper. Total virtual
+address footprint ~8MB. Saves every integrator from deriving the same config
+independently.
+
+**CLI flags `-buckets`, `-max-value`, `-classes`, `-dev`** (item #5):
+- `-buckets int` — sets `BucketsPerShard`. Use `-buckets 1` to reduce startup
+  memory footprint in constrained environments without changing semantics.
+- `-max-value bytes` — creates a single size class with the given ceiling; slot
+  size derived as `nextPow2(max_value)`. Common case: `-max-value 1048576`.
+- `-classes string` — comma-separated list of size class ceilings, e.g.
+  `64,4096,65536`; takes precedence over `-max-value`.
+- `-dev` — activates `DevConfig()` from the CLI; overrides all other Config
+  flags.
+
+**Enriched startup log line** (item #4b):
+```
+slabbis: listening on 127.0.0.1:6379 (shards=8, classes=5, max_value=262144B)
+```
+Lets operators immediately confirm the server is configured as intended.
+
+### Changed
+
+**SET handler now logs a WARN on oversized-value drop** (item #2a). When a
+`Set` call silently discards a value because it exceeds the largest size class,
+the server now logs:
+```
+slabbis: WARN SET "key": value (N bytes) exceeds largest size class — dropped; resize -max-value or -classes
+```
+One extra `Exists` call per dropped value. On the non-drop path (overwhelmingly
+the common case) there is no overhead.
+
+**README: KEYS vs SCAN design note** (item #4c). A new section explains that
+`SCAN` always completes in a single round-trip in slabbis, why this is correct
+for an in-memory store, and how it differs from disk-based Redis behaviour.
+Server usage examples updated with new flags.
+
+### Deferred
+
+**`Cache.Set` error return** (item #2b). Adding an error return to `Set` is the
+right long-term fix for surfacing oversized-value drops to callers. It is a
+breaking interface change and will be taken at v0.2.0.
+
+---
+
+## [0.1.4] - 2026-06-12
+
+### Added
+
+**13 new RESP commands** bringing slabbis substantially closer to full Redis
+string/key-management parity for caching workloads.
+
+Three new `Cache` interface methods underpin the atomic operations:
+
+- **`Cache.SetTTL(key string, ttl time.Duration) bool`**: updates the expiry of
+  an existing live key without touching its value. A zero `ttl` removes the
+  expiry (PERSIST semantics). Returns false if the key does not exist or is
+  already expired.
+
+- **`Cache.GetSet(key string, newVal []byte, ttl time.Duration) ([]byte, bool)`**:
+  atomically replaces a key's value and returns the old one. Returns `(nil,
+  false)` if the key did not previously exist. The new entry respects the
+  provided TTL.
+
+- **`Cache.IncrBy(key string, delta int64) (int64, error)`**: atomically
+  increments (or decrements, with negative delta) the integer value stored at
+  key, preserving any existing TTL. The value is stored and returned as a
+  decimal string, matching Redis semantics. Returns an error if the value is not
+  a valid integer or if the result would overflow `int64`. Missing keys are
+  treated as `"0"`.
+
+New server commands built on the above:
+
+- **`UNLINK key [key ...]`**: alias for `DEL`; synchronous in slabbis (no async
+  reclaim needed — the slab allocator handles that).
+- **`STRLEN key`**: returns the byte length of the value, or 0 if the key is
+  missing. Uses the pooled `GetInto` buffer; zero allocations in steady state.
+- **`INCR key`** / **`DECR key`**: increment or decrement by 1.
+- **`INCRBY key n`** / **`DECRBY key n`**: increment or decrement by `n`.
+  `INCRBY` accepts a signed `n`; `DECRBY` negates `n` before calling
+  `IncrBy`.
+- **`GETSET key value`**: atomic get-then-set; returns null bulk if key did not
+  exist.
+- **`GETEX key [EX s | PX ms | PERSIST]`**: get value and optionally update TTL
+  in the same command.
+- **`EXPIRE key seconds`** / **`PEXPIRE key milliseconds`**: set TTL on existing
+  key; returns 1 if key existed, 0 otherwise.
+- **`PERSIST key`**: remove expiry from key; returns 1 if key existed, 0
+  otherwise.
+- **`RANDOMKEY`**: returns a random live key, or null bulk on empty cache.
+- **`COPY source destination`**: copies the value of `source` to `destination`;
+  non-atomic (implemented as `GetCopy` + `Set`); returns 1 on success, 0 if
+  source does not exist.
+
+New helpers in `server.go`:
+
+- `parseSignedInt`: parses a signed decimal integer from a RESP argument for
+  use by `INCRBY` and `DECRBY`.
+
+**64 new tests** in `newops_test.go` covering all new methods and commands,
+including concurrency stress tests for `IncrBy` atomicity (50 goroutines ×
+100 ops each) and the `INCR` + `EXPIRE` rate-limit pattern.
+
+---
+
+## [0.1.3] - 2026-06-12
+
+### Fixed
+
+- **`Server.serveWg` was never incremented**: `Serve()` declared a `serveWg`
+  WaitGroup intended to track the accept-loop goroutine lifetime, but never
+  called `serveWg.Add(1)` or `serveWg.Done()`. `Close()` waited on it, which
+  was always a no-op. `Serve()` now increments the WaitGroup on entry and
+  decrements it on return, so `Close()` correctly waits for the accept loop to
+  exit before returning. Callers that run `Serve()` in a goroutine and call
+  `Close()` concurrently now have a proper happens-before guarantee.
+
+- **`parseInt` rejected empty input silently**: an empty byte slice produced a
+  zero return value with a nil error, which `parseSetOptions` would then accept
+  as a valid `0`-second TTL before the `n <= 0` guard rejected it. Empty input
+  now returns an explicit `"empty integer"` error. Error message for non-digit
+  bytes changed from `"not an integer"` to `"not a non-negative integer"` to
+  accurately describe the constraint (the function only accepts unsigned decimal
+  strings; negative sign is not valid syntax here).
+
+### Added
+
+- **`internal/resp`: direct unit tests for `WriteArrayHeader`**: three new tests
+  cover the streaming array write path — equivalence with `WriteArray`, a
+  zero-element header, and the MGET pattern of header followed by a mix of bulk
+  and null bulk strings. `WriteArrayHeader` was previously exercised only
+  indirectly through the server-level MGET test.
+
+### Removed
+
+- **README: phantom `bench/` entry**: the architecture table referenced
+  `bench/main.go` (comparative benchmark against Redis) which was never
+  created. The entry has been removed to eliminate confusion.
+
+---
+
 ## [0.1.2] - 2026-03-04
 
 ### Added

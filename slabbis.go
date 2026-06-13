@@ -26,6 +26,7 @@
 package slabbis
 
 import (
+	"errors"
 	"path"
 	"runtime"
 	"sync"
@@ -112,6 +113,28 @@ type Cache interface {
 	// DBSize returns the total number of live keys across all shards.
 	DBSize() int
 
+	// SetTTL updates the expiry of an existing live key without changing its
+	// value. Returns false if the key does not exist or has already expired.
+	//
+	// A zero ttl removes the expiry, making the key permanent (equivalent to
+	// PERSIST). A positive ttl sets a new absolute deadline from now.
+	SetTTL(key string, ttl time.Duration) bool
+
+	// GetSet atomically replaces the value for key with newVal and returns the
+	// old value. The new entry is stored with the given ttl (0 = no expiry).
+	// Returns (nil, false) if the key did not previously exist.
+	GetSet(key string, newVal []byte, ttl time.Duration) ([]byte, bool)
+
+	// IncrBy atomically increments the integer value stored at key by delta
+	// (use negative delta for decrement) and returns the new value.
+	// The value must be a decimal integer string; if it is not, or if the
+	// result would overflow int64, an error is returned.
+	// If the key does not exist it is created with value "0" before applying
+	// the increment.
+	// The stored value is always the decimal string representation of the
+	// result, compatible with Redis INCR/DECR/INCRBY/DECRBY semantics.
+	IncrBy(key string, delta int64) (int64, error)
+
 	// Close stops background goroutines. The cache must not be used after Close.
 	Close()
 }
@@ -177,6 +200,44 @@ func (c Config) bucketsPerShard() int {
 		return runtime.NumCPU()
 	}
 	return c.BucketsPerShard
+}
+
+// MaxValueSize returns the maximum value size in bytes that this configuration
+// will accept. Values larger than this are silently dropped by Set.
+//
+// The ceiling is the MaxSize of the largest configured size class. Callers can
+// use this to guard against silent drops before calling Set:
+//
+//	if len(value) > cfg.MaxValueSize() {
+//	    // handle oversize value explicitly
+//	}
+func (c Config) MaxValueSize() int {
+	classes := c.classes()
+	if len(classes) == 0 {
+		return 0
+	}
+	return classes[len(classes)-1].MaxSize
+}
+
+// DevConfig returns a Config suitable for development, testing, and
+// memory-constrained environments (CI containers, sandboxes).
+//
+// Characteristics: two size classes (64B and 4KB), one shard, one bucket per
+// shard, fast reaper interval. Total virtual address footprint is approximately
+// 8MB — safe for any environment. Maximum storable value size is 4096 bytes.
+//
+// For production use, prefer New(Config{}) which applies DefaultClasses and
+// scales shards and buckets to the available CPU count.
+func DevConfig() Config {
+	return Config{
+		Shards:          1,
+		BucketsPerShard: 1,
+		ReaperInterval:  50 * time.Millisecond,
+		Classes: []slabber.SizeClass{
+			{MaxSize: 64},
+			{MaxSize: 4096},
+		},
+	}
 }
 
 // entry is a single cache record within a shard.
@@ -503,6 +564,111 @@ func (c *cache) DBSize() int {
 	return c.Stats().Keys
 }
 
+func (c *cache) SetTTL(key string, ttl time.Duration) bool {
+	s := c.shardFor(key)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	e, ok := s.entries[key]
+	if !ok || e.expired() {
+		return false
+	}
+	if ttl <= 0 {
+		e.expiry = time.Time{} // zero = no expiry (PERSIST)
+	} else {
+		e.expiry = time.Now().Add(ttl)
+	}
+	s.entries[key] = e
+	return true
+}
+
+func (c *cache) GetSet(key string, newVal []byte, ttl time.Duration) ([]byte, bool) {
+	s := c.shardFor(key)
+	var expiry time.Time
+	if ttl > 0 {
+		expiry = time.Now().Add(ttl)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// Capture old value.
+	e, existed := s.entries[key]
+	var old []byte
+	if existed && !e.expired() {
+		if slot, ok := s.arena.Slot(e.ref); ok {
+			old = make([]byte, e.length)
+			copy(old, slot[:e.length])
+		}
+	}
+
+	// Free old slot regardless (expired or not).
+	if existed {
+		s.arena.Free(e.ref)
+	}
+
+	// Allocate new slot.
+	ref, slot, ok := s.arena.Alloc(len(newVal))
+	if !ok {
+		delete(s.entries, key)
+		return old, existed && old != nil
+	}
+	copy(slot, newVal)
+	s.entries[key] = entry{ref: ref, length: len(newVal), expiry: expiry}
+	return old, existed && old != nil
+}
+
+func (c *cache) IncrBy(key string, delta int64) (int64, error) {
+	s := c.shardFor(key)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	var cur int64
+	var prevExpiry time.Time
+
+	e, exists := s.entries[key]
+	if exists {
+		if e.expired() {
+			s.arena.Free(e.ref)
+			delete(s.entries, key)
+			exists = false
+		} else {
+			slot, slotOK := s.arena.Slot(e.ref)
+			if !slotOK {
+				return 0, errInvalidInteger
+			}
+			var err error
+			cur, err = parseDecimalInt(slot[:e.length])
+			if err != nil {
+				return 0, errInvalidInteger
+			}
+			prevExpiry = e.expiry
+		}
+	}
+
+	// Overflow check.
+	if delta > 0 && cur > maxInt64-delta {
+		return 0, errOverflow
+	}
+	if delta < 0 && cur < minInt64-delta {
+		return 0, errOverflow
+	}
+	result := cur + delta
+
+	// Free old slot (if key was live) and allocate new one for the result string.
+	str := formatInt(result)
+	if exists {
+		s.arena.Free(e.ref)
+	}
+	ref, slot, allocOK := s.arena.Alloc(len(str))
+	if !allocOK {
+		delete(s.entries, key)
+		return 0, errOverflow
+	}
+	copy(slot, str)
+	// Preserve TTL from the live entry; new keys get no expiry.
+	s.entries[key] = entry{ref: ref, length: len(str), expiry: prevExpiry}
+	return result, nil
+}
+
 func (c *cache) Close() {
 	close(c.stop)
 	c.wg.Wait()
@@ -529,4 +695,84 @@ func (c *cache) reap(s *shard, interval time.Duration) {
 			s.mu.Unlock()
 		}
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Integer helpers (used by IncrBy)
+// ---------------------------------------------------------------------------
+
+var (
+	errInvalidInteger = errors.New("value is not an integer or out of range")
+	errOverflow       = errors.New("increment or decrement would overflow")
+)
+
+const (
+	maxInt64 = int64(^uint64(0) >> 1)
+	minInt64 = -maxInt64 - 1
+)
+
+// parseDecimalInt parses a signed decimal integer from b.
+// Accepts optional leading '-'. No leading zeros permitted beyond "0" itself.
+func parseDecimalInt(b []byte) (int64, error) {
+	if len(b) == 0 {
+		return 0, errInvalidInteger
+	}
+	neg := false
+	i := 0
+	if b[0] == '-' {
+		neg = true
+		i = 1
+	}
+	if i >= len(b) {
+		return 0, errInvalidInteger
+	}
+	var n uint64
+	for ; i < len(b); i++ {
+		c := b[i]
+		if c < '0' || c > '9' {
+			return 0, errInvalidInteger
+		}
+		n = n*10 + uint64(c-'0')
+		if n > uint64(maxInt64)+1 {
+			return 0, errInvalidInteger
+		}
+	}
+	if neg {
+		if n > uint64(maxInt64)+1 {
+			return 0, errInvalidInteger
+		}
+		return -int64(n), nil
+	}
+	if n > uint64(maxInt64) {
+		return 0, errInvalidInteger
+	}
+	return int64(n), nil
+}
+
+// formatInt converts n to its decimal string representation.
+// Uses a fixed-size stack buffer to avoid heap allocation for the common case.
+func formatInt(n int64) []byte {
+	if n == 0 {
+		return []byte("0")
+	}
+	var buf [20]byte // max int64 is 19 digits + sign
+	pos := len(buf)
+	neg := n < 0
+	u := uint64(n)
+	if neg {
+		u = uint64(-n)
+	}
+	for u > 0 {
+		pos--
+		buf[pos] = byte('0' + u%10)
+		u /= 10
+	}
+	if neg {
+		pos--
+		buf[pos] = '-'
+	}
+	// Return a heap copy so the caller can store it safely.
+	out := make([]byte, len(buf)-pos)
+	copy(out, buf[pos:])
+	return out
 }

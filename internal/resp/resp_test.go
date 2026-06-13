@@ -237,7 +237,52 @@ func TestWriteArrayEmpty(t *testing.T) {
 	}
 }
 
-// ---- roundtrip --------------------------------------------------------------
+func TestWriteArrayHeader(t *testing.T) {
+	// WriteArrayHeader followed by two individual WriteBulk calls must produce
+	// the same wire bytes as WriteArray with the same elements.
+	var bufHeader, bufArray bytes.Buffer
+
+	wrH := resp.NewWriter(&bufHeader)
+	_ = wrH.WriteArrayHeader(2)
+	_ = wrH.WriteBulk([]byte("foo"))
+	_ = wrH.WriteBulk([]byte("bar"))
+	_ = wrH.Flush()
+
+	wrA := resp.NewWriter(&bufArray)
+	_ = wrA.WriteArray([][]byte{[]byte("foo"), []byte("bar")})
+	_ = wrA.Flush()
+
+	if bufHeader.String() != bufArray.String() {
+		t.Fatalf("WriteArrayHeader output %q differs from WriteArray output %q",
+			bufHeader.String(), bufArray.String())
+	}
+}
+
+func TestWriteArrayHeaderZero(t *testing.T) {
+	var buf bytes.Buffer
+	wr := resp.NewWriter(&buf)
+	_ = wr.WriteArrayHeader(0)
+	_ = wr.Flush()
+	if buf.String() != "*0\r\n" {
+		t.Fatalf("got %q, want *0\\r\\n", buf.String())
+	}
+}
+
+func TestWriteArrayHeaderThenNull(t *testing.T) {
+	// Server MGET path: header followed by a mix of bulk and null bulk strings.
+	var buf bytes.Buffer
+	wr := resp.NewWriter(&buf)
+	_ = wr.WriteArrayHeader(3)
+	_ = wr.WriteBulk([]byte("alpha"))
+	_ = wr.WriteBulk(nil) // null bulk (cache miss)
+	_ = wr.WriteBulk([]byte("gamma"))
+	_ = wr.Flush()
+
+	want := "*3\r\n$5\r\nalpha\r\n$-1\r\n$5\r\ngamma\r\n"
+	if buf.String() != want {
+		t.Fatalf("got %q, want %q", buf.String(), want)
+	}
+}
 
 func TestRoundtrip(t *testing.T) {
 	// Write a SET command as a client would, then read it back as a server would.

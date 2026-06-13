@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math/rand"
 	"net"
 	"sort"
 	"strings"
@@ -34,18 +35,32 @@ var valBufPool = sync.Pool{
 //
 //	GET key
 //	SET key value [EX seconds | PX milliseconds]
+//	GETSET key value
+//	GETEX key [EX seconds | PX milliseconds | PERSIST]
 //	MGET key [key ...]
 //	MSET key value [key value ...]
 //	SETNX key value
 //	GETDEL key
 //	DEL key [key ...]
+//	UNLINK key [key ...]
 //	EXISTS key [key ...]
+//	STRLEN key
+//	INCR key
+//	INCRBY key increment
+//	DECR key
+//	DECRBY key decrement
 //	KEYS pattern
+//	SCAN cursor [MATCH pattern] [COUNT count]
+//	RANDOMKEY
+//	COPY source destination
 //	RENAME from to
 //	DBSIZE
 //	TYPE key
 //	TTL key
 //	PTTL key
+//	EXPIRE key seconds
+//	PEXPIRE key milliseconds
+//	PERSIST key
 //	FLUSH (non-standard; equivalent to FLUSHALL)
 //	PING [message]
 //	COMMAND (returns empty array — satisfies redis-cli startup probe)
@@ -87,7 +102,12 @@ func (s *Server) Addr() string {
 // Serve accepts connections until the listener is closed.
 // It returns the listener's close error, which is typically non-nil only
 // when Close() has been called.
+//
+// Serve registers itself with serveWg so that Close() can wait for the
+// accept loop to return before declaring shutdown complete.
 func (s *Server) Serve() error {
+	s.serveWg.Add(1)
+	defer s.serveWg.Done()
 	for {
 		conn, err := s.listener.Accept()
 		if err != nil {
@@ -99,6 +119,8 @@ func (s *Server) Serve() error {
 }
 
 // Close stops the server and waits for all goroutines to return.
+// It closes the listener first (causing Serve to return), then waits for
+// Serve itself and all active connection handlers to finish.
 func (s *Server) Close() error {
 	err := s.listener.Close()
 	s.serveWg.Wait()
@@ -171,6 +193,15 @@ func (s *Server) dispatch(cmd *resp.Command, wr *resp.Writer) bool {
 			return false
 		}
 		s.cache.Set(key, value, ttl)
+		// Detect silent drop: if the value is non-empty but the key is now
+		// absent, it exceeded the largest Arena size class and was discarded.
+		// This is an expected limitation of the current slab-only storage, but
+		// silently losing data is extremely hard to debug. Log a warning so
+		// operators know immediately which keys and sizes are affected.
+		if len(value) > 0 && !s.cache.Exists(key) {
+			s.log.Printf("WARN SET %q: value (%d bytes) exceeds largest size class — dropped; resize -max-value or -classes",
+				key, len(value))
+		}
 		_ = wr.WriteSimpleString("OK")
 
 	case "DEL":
@@ -234,6 +265,43 @@ func (s *Server) dispatch(cmd *resp.Command, wr *resp.Writer) bool {
 		}
 		keys := s.cache.Keys(string(cmd.Args[1]))
 		sort.Strings(keys)
+		items := make([][]byte, len(keys))
+		for i, k := range keys {
+			items[i] = []byte(k)
+		}
+		_ = wr.WriteArray(items)
+
+	case "SCAN":
+		// SCAN cursor [MATCH pattern] [COUNT count]
+		//
+		// slabbis is an in-memory store: all matching keys are always available
+		// in a single pass. We return cursor "0" on every call, which per the
+		// RESP spec signals that the full iteration is complete. Clients that
+		// loop until cursor "0" will terminate correctly after the first call.
+		//
+		// COUNT is accepted but ignored — the count hint controls batch size in
+		// a persistent store; here there is no cost to returning all keys at once.
+		//
+		// SCAN requires at least a cursor argument; extra args are MATCH/COUNT pairs.
+		if len(cmd.Args) < 2 {
+			_ = wr.WriteError("wrong number of arguments for SCAN")
+			return false
+		}
+		pattern := "*"
+		args := cmd.Args[2:] // skip verb and cursor
+		for i := 0; i+1 < len(args); i += 2 {
+			switch strings.ToUpper(string(args[i])) {
+			case "MATCH":
+				pattern = string(args[i+1])
+			case "COUNT":
+				// accepted and ignored
+			}
+		}
+		keys := s.cache.Keys(pattern)
+		sort.Strings(keys)
+		// RESP response: *2 [ bulk_string("0"), array_of_keys ]
+		_ = wr.WriteArrayHeader(2)
+		_ = wr.WriteBulk([]byte("0"))
 		items := make([][]byte, len(keys))
 		for i, k := range keys {
 			items[i] = []byte(k)
@@ -338,6 +406,214 @@ func (s *Server) dispatch(cmd *resp.Command, wr *resp.Writer) bool {
 		_ = wr.WriteSimpleString("OK")
 		return true
 
+	case "UNLINK":
+		// UNLINK is an async DEL in Redis; for slabbis it is synchronous DEL.
+		if len(cmd.Args) < 2 {
+			_ = wr.WriteError("wrong number of arguments for UNLINK")
+			return false
+		}
+		var n int64
+		for _, arg := range cmd.Args[1:] {
+			if s.cache.Del(string(arg)) {
+				n++
+			}
+		}
+		_ = wr.WriteInt(n)
+
+	case "STRLEN":
+		if len(cmd.Args) != 2 {
+			_ = wr.WriteError("wrong number of arguments for STRLEN")
+			return false
+		}
+		bp := valBufPool.Get().(*[]byte)
+		dst, ok := s.cache.GetInto(string(cmd.Args[1]), *bp)
+		*bp = dst
+		valBufPool.Put(bp)
+		if !ok {
+			_ = wr.WriteInt(0)
+		} else {
+			_ = wr.WriteInt(int64(len(dst)))
+		}
+
+	case "INCR":
+		if len(cmd.Args) != 2 {
+			_ = wr.WriteError("wrong number of arguments for INCR")
+			return false
+		}
+		n, err := s.cache.IncrBy(string(cmd.Args[1]), 1)
+		if err != nil {
+			_ = wr.WriteError(err.Error())
+		} else {
+			_ = wr.WriteInt(n)
+		}
+
+	case "DECR":
+		if len(cmd.Args) != 2 {
+			_ = wr.WriteError("wrong number of arguments for DECR")
+			return false
+		}
+		n, err := s.cache.IncrBy(string(cmd.Args[1]), -1)
+		if err != nil {
+			_ = wr.WriteError(err.Error())
+		} else {
+			_ = wr.WriteInt(n)
+		}
+
+	case "INCRBY":
+		if len(cmd.Args) != 3 {
+			_ = wr.WriteError("wrong number of arguments for INCRBY")
+			return false
+		}
+		delta, err := parseSignedInt(cmd.Args[2])
+		if err != nil {
+			_ = wr.WriteError("value is not an integer or out of range")
+			return false
+		}
+		n, err := s.cache.IncrBy(string(cmd.Args[1]), delta)
+		if err != nil {
+			_ = wr.WriteError(err.Error())
+		} else {
+			_ = wr.WriteInt(n)
+		}
+
+	case "DECRBY":
+		if len(cmd.Args) != 3 {
+			_ = wr.WriteError("wrong number of arguments for DECRBY")
+			return false
+		}
+		delta, err := parseSignedInt(cmd.Args[2])
+		if err != nil {
+			_ = wr.WriteError("value is not an integer or out of range")
+			return false
+		}
+		n, err := s.cache.IncrBy(string(cmd.Args[1]), -delta)
+		if err != nil {
+			_ = wr.WriteError(err.Error())
+		} else {
+			_ = wr.WriteInt(n)
+		}
+
+	case "GETSET":
+		if len(cmd.Args) != 3 {
+			_ = wr.WriteError("wrong number of arguments for GETSET")
+			return false
+		}
+		old, _ := s.cache.GetSet(string(cmd.Args[1]), cmd.Args[2], 0)
+		_ = wr.WriteBulk(old) // nil → null bulk if key did not exist
+
+	case "GETEX":
+		// GETEX key [EX seconds | PX milliseconds | PERSIST]
+		if len(cmd.Args) < 2 {
+			_ = wr.WriteError("wrong number of arguments for GETEX")
+			return false
+		}
+		key := string(cmd.Args[1])
+		bp := valBufPool.Get().(*[]byte)
+		dst, found := s.cache.GetInto(key, *bp)
+		*bp = dst
+		if !found {
+			valBufPool.Put(bp)
+			_ = wr.WriteBulk(nil)
+			return false
+		}
+		// Return value before applying TTL change.
+		_ = wr.WriteBulk(dst)
+		valBufPool.Put(bp)
+		// Apply optional TTL modifier.
+		if len(cmd.Args) >= 3 {
+			opt := strings.ToUpper(string(cmd.Args[2]))
+			switch opt {
+			case "PERSIST":
+				s.cache.SetTTL(key, 0)
+			case "EX":
+				if len(cmd.Args) != 4 {
+					// Already wrote the value; don't write another response.
+					return false
+				}
+				n, err := parseInt(cmd.Args[3])
+				if err != nil || n <= 0 {
+					return false
+				}
+				s.cache.SetTTL(key, time.Duration(n)*time.Second)
+			case "PX":
+				if len(cmd.Args) != 4 {
+					return false
+				}
+				n, err := parseInt(cmd.Args[3])
+				if err != nil || n <= 0 {
+					return false
+				}
+				s.cache.SetTTL(key, time.Duration(n)*time.Millisecond)
+			}
+		}
+
+	case "EXPIRE":
+		if len(cmd.Args) != 3 {
+			_ = wr.WriteError("wrong number of arguments for EXPIRE")
+			return false
+		}
+		n, err := parseInt(cmd.Args[2])
+		if err != nil || n <= 0 {
+			_ = wr.WriteError("invalid expire time in EXPIRE")
+			return false
+		}
+		if s.cache.SetTTL(string(cmd.Args[1]), time.Duration(n)*time.Second) {
+			_ = wr.WriteInt(1)
+		} else {
+			_ = wr.WriteInt(0)
+		}
+
+	case "PEXPIRE":
+		if len(cmd.Args) != 3 {
+			_ = wr.WriteError("wrong number of arguments for PEXPIRE")
+			return false
+		}
+		n, err := parseInt(cmd.Args[2])
+		if err != nil || n <= 0 {
+			_ = wr.WriteError("invalid expire time in PEXPIRE")
+			return false
+		}
+		if s.cache.SetTTL(string(cmd.Args[1]), time.Duration(n)*time.Millisecond) {
+			_ = wr.WriteInt(1)
+		} else {
+			_ = wr.WriteInt(0)
+		}
+
+	case "PERSIST":
+		if len(cmd.Args) != 2 {
+			_ = wr.WriteError("wrong number of arguments for PERSIST")
+			return false
+		}
+		// SetTTL with 0 removes the expiry.
+		if s.cache.SetTTL(string(cmd.Args[1]), 0) {
+			_ = wr.WriteInt(1)
+		} else {
+			_ = wr.WriteInt(0)
+		}
+
+	case "RANDOMKEY":
+		keys := s.cache.Keys("*")
+		if len(keys) == 0 {
+			_ = wr.WriteBulk(nil)
+		} else {
+			_ = wr.WriteBulk([]byte(keys[rand.Intn(len(keys))]))
+		}
+
+	case "COPY":
+		// COPY source destination — non-atomic: GetCopy + Set.
+		// Returns 1 on success, 0 if source does not exist.
+		if len(cmd.Args) != 3 {
+			_ = wr.WriteError("wrong number of arguments for COPY")
+			return false
+		}
+		val, ok := s.cache.GetCopy(string(cmd.Args[1]))
+		if !ok {
+			_ = wr.WriteInt(0)
+		} else {
+			s.cache.Set(string(cmd.Args[2]), val, 0)
+			_ = wr.WriteInt(1)
+		}
+
 	default:
 		_ = wr.WriteError(fmt.Sprintf("unknown command %q", cmd.Name()))
 	}
@@ -370,12 +646,51 @@ func parseSetOptions(args [][]byte) (time.Duration, error) {
 }
 
 func parseInt(b []byte) (int64, error) {
+	if len(b) == 0 {
+		return 0, fmt.Errorf("empty integer")
+	}
 	var n int64
 	for _, c := range b {
 		if c < '0' || c > '9' {
-			return 0, fmt.Errorf("not an integer")
+			return 0, fmt.Errorf("not a non-negative integer")
 		}
 		n = n*10 + int64(c-'0')
 	}
 	return n, nil
+}
+
+// parseSignedInt parses a signed decimal integer from a RESP argument.
+// Accepts an optional leading '-'. Used by INCRBY and DECRBY.
+func parseSignedInt(b []byte) (int64, error) {
+	if len(b) == 0 {
+		return 0, fmt.Errorf("empty integer")
+	}
+	neg := false
+	i := 0
+	if b[0] == '-' {
+		neg = true
+		i = 1
+	}
+	if i >= len(b) {
+		return 0, fmt.Errorf("not an integer")
+	}
+	var n uint64
+	for ; i < len(b); i++ {
+		c := b[i]
+		if c < '0' || c > '9' {
+			return 0, fmt.Errorf("not an integer")
+		}
+		n = n*10 + uint64(c-'0')
+	}
+	const maxInt64 = uint64(1<<63 - 1)
+	if neg {
+		if n > maxInt64+1 {
+			return 0, fmt.Errorf("value out of range")
+		}
+		return -int64(n), nil
+	}
+	if n > maxInt64 {
+		return 0, fmt.Errorf("value out of range")
+	}
+	return int64(n), nil
 }
